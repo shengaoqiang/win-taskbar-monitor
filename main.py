@@ -13,11 +13,12 @@ from __future__ import annotations
 import sys
 import os
 import ctypes
+import threading
 from ctypes import wintypes
-from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRect, QRectF
+from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRect, QRectF, QUrl
 from PySide6.QtGui import (
     QActionGroup, QColor, QIcon, QPainter, QPen, QBrush, QPolygonF,
-    QFont, QFontMetrics,
+    QFont, QFontMetrics, QDesktopServices,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame,
@@ -26,9 +27,12 @@ from PySide6.QtWidgets import (
 
 import autostart
 import config
+import updater
 from collector import Collector
 from widgets import Sparkline, MeterBar, CoreGrid
 from taskbar_pos import TaskbarInfo
+
+__version__ = "1.1.0"
 
 # Win32 强制置顶：第三方窗口设了 StaysOnTop 也未必压得过 explorer 的任务栏，
 # 用 SetWindowPos(HWND_TOPMOST) 周期性把内嵌条重新顶到最前最稳。
@@ -853,6 +857,15 @@ class TrayApp:
         screen.geometryChanged.connect(self._reposition)
         screen.logicalDotsPerInchChanged.connect(self._reposition)
 
+        # 更新检查：开机 5 秒后跑一次，之后每 6 小时。线程只写 _pending_update，
+        # 由 _on_tick 在 UI 线程消费——跨线程直接碰控件会崩。
+        self._pending_update = None
+        self._update_url = ""
+        QTimer.singleShot(5000, self._check_update)
+        self._upd_timer = QTimer(self._strip)
+        self._upd_timer.timeout.connect(self._check_update)
+        self._upd_timer.start(6 * 60 * 60 * 1000)
+
     # ---- 任务栏几何 / 位置约束 ----
     def _apply_taskbar(self, info):
         """按任务栏几何刷新条的尺寸（宽度按内容自适应）和可拖动范围。"""
@@ -931,6 +944,12 @@ class TrayApp:
         self._act_autostart.setChecked(autostart.is_enabled())
         self._act_autostart.triggered.connect(self._toggle_autostart)
 
+        self._act_update = m.addAction("有新版本")   # 平时隐藏，查到了才插进来
+        self._act_update.setVisible(False)
+        self._act_update.triggered.connect(self._open_update)
+        self._act_check = m.addAction("检查更新")
+        self._act_check.triggered.connect(lambda: self._check_update(True))
+
         m.addSeparator()
         self._act_quit = m.addAction("退出")
         self._act_quit.triggered.connect(self._app.quit)
@@ -999,6 +1018,33 @@ class TrayApp:
     def _refresh_strip_menu(self):
         self._refresh_switch_menu()
 
+    def _check_update(self, manual=False):
+        """manual=True 是用户点的，没新版也要回一句；自动检查则全程静默。"""
+        threading.Thread(target=self._check_update_worker, args=(manual,),
+                         name="update-check", daemon=True).start()
+
+    def _check_update_worker(self, manual):
+        found = updater.check(__version__)
+        self._pending_update = (found, manual)   # 交给 _on_tick 消费
+
+    def _apply_update(self, found, manual):
+        if found:
+            ver, url = found
+            self._update_url = url
+            self._act_update.setText(f"有新版本 v{ver} ↗")
+            self._act_update.setVisible(True)
+            self._tray.showMessage(
+                "发现新版本", f"v{ver} 已发布，右键托盘图标下载",
+                QSystemTrayIcon.Information, 5000)
+        elif manual:
+            self._tray.showMessage(
+                "资源监控", f"已是最新版本 v{__version__}",
+                QSystemTrayIcon.Information, 3000)
+
+    def _open_update(self):
+        if self._update_url:
+            QDesktopServices.openUrl(QUrl(self._update_url))
+
     def _toggle_autostart(self):
         want = self._act_autostart.isChecked()
         if autostart.set_enabled(want):
@@ -1049,6 +1095,10 @@ class TrayApp:
             bind_to_taskbar(self._strip)  # HWND 被 Qt 重建或 explorer 重启后补绑
         if not self._panel.isHidden():
             self._panel.refresh()
+        if self._pending_update is not None:
+            found, manual = self._pending_update
+            self._pending_update = None
+            self._apply_update(found, manual)
         self._tray.setToolTip(
             f"CPU {s.cpu:.0f}%  内存 {s.mem_pct:.0f}%  "
             f"↓{Collector.fmt_speed(s.net_down)}  ↑{Collector.fmt_speed(s.net_up)}"
