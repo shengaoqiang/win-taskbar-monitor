@@ -12,7 +12,7 @@
 
 ## 下载即用（推荐，不需要 Python）
 
-1. 打开右侧 [Releases](../../releases)，下载最新版 `TaskbarMonitor.zip`
+1. 打开右侧 [Releases](../../releases)，下载最新版 `TaskbarMonitor-win64.zip`
 2. 解压到**有写权限的目录**（例如 `D:\Tools\TaskbarMonitor`，不要放 `C:\Program Files`）
 3. 双击 `TaskbarMonitor.exe`
 
@@ -45,12 +45,16 @@ python main.py
 ## 自己打包 exe
 
 ```bash
-pip install pyinstaller
-pyinstaller --noconfirm --clean --windowed --name TaskbarMonitor --icon app.ico main.py
+pip install -r requirements.txt pyinstaller
+python tools/make_icon.py          # 生成 app.ico
+pyinstaller --noconfirm --clean TaskbarMonitor.spec
 ```
 
 产物在 `dist/TaskbarMonitor/`，整个文件夹一起分发（不要只拷 exe）。
 用 onedir 而不是 onefile：PySide6 打 onefile 启动要 3~5 秒，且更容易被杀软误报。
+
+推送到 `main` 后 GitHub Actions 会自动打包并上传 artifact；
+在 Actions 页手动 Run workflow 并填版本号（如 `v1.0.0`），会自动创建 Release 并附上 zip。
 
 ## 已知限制
 

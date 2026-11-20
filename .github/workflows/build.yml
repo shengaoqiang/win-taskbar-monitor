@@ -1,0 +1,48 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "填版本号（如 v1.0.0）才创建 Release"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build
+        run: |
+          python tools/make_icon.py
+          pyinstaller --noconfirm --clean TaskbarMonitor.spec
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/TaskbarMonitor -DestinationPath dist/TaskbarMonitor-win64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TaskbarMonitor-win64
+          path: dist/TaskbarMonitor-win64.zip
+
+      - name: Publish release
+        if: github.event_name == 'workflow_dispatch' && inputs.version != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          files: dist/TaskbarMonitor-win64.zip
