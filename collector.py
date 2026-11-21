@@ -45,8 +45,7 @@ class Collector:
         self._last = Sample(ts=time.time())
         self.history: deque = deque(maxlen=HIST_LEN)
 
-        # 差分基准
-        self._net_prev = psutil.net_io_counters()
+        # 差分基准：网络只留 pernic 一份，总量由各网卡求和（见 tick）
         self._nic_prev = psutil.net_io_counters(pernic=True)
         self._disk_prev = psutil.disk_io_counters()
         self._t_prev = time.time()
@@ -69,8 +68,12 @@ class Collector:
         #     target=self._scan_loop, name="proc-scan", daemon=True)
         # self._proc_thread.start()
 
-    def tick(self) -> Sample:
-        """被定时器周期性调用，刷新 last 与 history。"""
+    def tick(self, with_details: bool = True) -> Sample:
+        """被定时器周期性调用，刷新 last 与 history。
+
+        with_details=False 时跳过分区枚举和分网卡明细——这两项只有面板用得上，
+        面板关着还每秒采一次纯属浪费（分区枚举在多盘机器上还要走系统调用）。
+        """
         now = time.time()
 
         cpu = psutil.cpu_percent(interval=None)
@@ -79,23 +82,23 @@ class Collector:
         du = psutil.disk_usage(self._sys_drive)
         dt = max(now - self._t_prev, 1e-6)
 
-        # 网络速率
-        net = psutil.net_io_counters()
-        net_up = (net.bytes_sent - self._net_prev.bytes_sent) / dt
-        net_down = (net.bytes_recv - self._net_prev.bytes_recv) / dt
-        self._net_prev = net
-
-        # 分网卡速率：虚拟网卡/Loopback 恒为 0，只留真正在跑的，按流量降序取前 3
+        # 网络：一次 pernic 查询同时算总量和分网卡明细。6 张卡时单次约 5ms，
+        # 再单独调一次 net_io_counters() 拿总量等于白烧一半时间。
         nics = []
+        up_sum = down_sum = 0.0
         cur_nic = psutil.net_io_counters(pernic=True)
         for name, c in cur_nic.items():
-            prev = self._nic_prev.get(name, c)
+            prev = self._nic_prev.get(name, c)      # 新插上的网卡首帧速率算 0
             up = (c.bytes_sent - prev.bytes_sent) / dt
             down = (c.bytes_recv - prev.bytes_recv) / dt
-            if down + up > 1:
+            up_sum += up
+            down_sum += down
+            if with_details and down + up > 1:      # 虚拟网卡/Loopback 恒为 0，滤掉
                 nics.append((name, max(up, 0.0), max(down, 0.0)))
         self._nic_prev = cur_nic
-        nics.sort(key=lambda x: x[1] + x[2], reverse=True)
+        if with_details:
+            nics.sort(key=lambda x: x[1] + x[2], reverse=True)
+        net_up, net_down = max(up_sum, 0.0), max(down_sum, 0.0)
         disk_read = disk_write = 0.0
         dio = psutil.disk_io_counters()
         if dio:
@@ -124,7 +127,7 @@ class Collector:
             disk_used_gb=du.used / 1024 ** 3,
             disk_total_gb=du.total / 1024 ** 3,
             disk_drive=self._sys_drive[0],
-            partitions=self._partitions(),
+            partitions=self._partitions() if with_details else None,
             gpu_pct=gpu_pct,
             vram_gb=vram_gb,
             uptime=now - self._boot_ts,

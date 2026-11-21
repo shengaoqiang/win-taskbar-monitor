@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 
 import autostart
 import config
+import fullscreen
 import updater
 from collector import Collector
 from widgets import Sparkline, MeterBar, CoreGrid
@@ -234,6 +235,8 @@ class DetailPanel(QWidget):
         self._is_dark = True
         self._state = Palette.STATE["dark"]
         self._caps: list[QLabel] = []   # 各卡标题，统一刷灰字色
+        self._color_of = {}       # 控件当前字色，颜色没变就别再 setStyleSheet
+        self._size_key = None      # 上次的分区行数/网卡状态，没变就不用重算布局
         self.on_moved = None      # 拖动结束回调，由 TrayApp 注入用于存位置
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
@@ -428,16 +431,17 @@ class DetailPanel(QWidget):
             QLabel{{color:{dim};}}
         """)
         # 主文字色（数值/名称）与灰文字色（说明）分两组刷，避免逐个判断
+        self._color_of.clear()      # 主题变了，缓存作废
         for lb in (self._title, self._mem_val, self._net_val):
-            lb.setStyleSheet(f"color:{text};")
+            self._set_fg(lb, text)
         for lb in (self._uptime, self._close, self._core_sum, self._mem_sub,
                    self._io_val, self._foot, self._cpu_sub, self._gpu_sub,
                    self._nic_line, *self._caps):
-            lb.setStyleSheet(f"color:{dim};")
+            self._set_fg(lb, dim)
         for name, pct, size, _ in self._part_rows:
-            name.setStyleSheet(f"color:{text};")
-            pct.setStyleSheet(f"color:{dim};")
-            size.setStyleSheet(f"color:{dim};")
+            self._set_fg(name, text)
+            self._set_fg(pct, dim)
+            self._set_fg(size, dim)
 
         self._cpu_spark.set_color(self._state["green"])
         self._gpu_spark.set_color(self._state["green"])
@@ -453,6 +457,12 @@ class DetailPanel(QWidget):
             bar.set_track(track)
         self.refresh()
         self.adjustSize()
+
+    def _set_fg(self, w, color: str):
+        """setStyleSheet 会触发整棵样式树重算，颜色没变就别碰——每秒刷一次很贵。"""
+        if self._color_of.get(w) != color:
+            self._color_of[w] = color
+            w.setStyleSheet(f"color:{color};")
 
     def _pct_color(self, v) -> str:
         if v is None:
@@ -476,7 +486,7 @@ class DetailPanel(QWidget):
         # CPU / GPU 双卡
         c = self._pct_color(s.cpu)
         self._cpu_val.setText(f"{s.cpu:.0f}%")
-        self._cpu_val.setStyleSheet(f"color:{c};")
+        self._set_fg(self._cpu_val, c)
         cpu_hist = [x.cpu for x in hist]
         # 上限按峰值浮动：固定 100 时低负载曲线会贴在底边，看不出起伏
         self._cpu_spark.set_color(c)          # 曲线跟数值同色，高负载整卡转红
@@ -487,7 +497,7 @@ class DetailPanel(QWidget):
 
         g = self._pct_color(s.gpu_pct)
         self._gpu_val.setText("--" if s.gpu_pct is None else f"{s.gpu_pct:.0f}%")
-        self._gpu_val.setStyleSheet(f"color:{g};")
+        self._set_fg(self._gpu_val, g)
         gpu_hist = [x.gpu_pct or 0.0 for x in hist]
         self._gpu_spark.set_color(g)
         self._gpu_spark.set_data(gpu_hist,
@@ -505,7 +515,7 @@ class DetailPanel(QWidget):
 
         # 内存
         self._mem_val.setText(f"{s.mem_pct:.0f}%")
-        self._mem_val.setStyleSheet(f"color:{self._pct_color(s.mem_pct)};")
+        self._set_fg(self._mem_val, self._pct_color(s.mem_pct))
         self._mem_bar.set_parts([(s.mem_pct / 100.0, self._pct_color(s.mem_pct))])
         self._mem_sub.setText(
             f"{s.mem_used_gb:.1f} / {s.mem_total_gb:.1f} GB"
@@ -518,7 +528,7 @@ class DetailPanel(QWidget):
                 name, used, total, pct = parts[i]
                 name_lb.setText(name)
                 pct_lb.setText(f"{pct:.0f}%")
-                pct_lb.setStyleSheet(f"color:{self._pct_color(pct)};")
+                self._set_fg(pct_lb, self._pct_color(pct))
                 size_lb.setText(f"{used:.0f} / {total:.0f} GB")
                 bar.set_parts([(pct / 100.0, self._pct_color(pct))])
                 for w in (name_lb, pct_lb, size_lb, bar):
@@ -534,7 +544,7 @@ class DetailPanel(QWidget):
         self._net_val.setText(
             f"↓ {Collector.fmt_speed_compact(s.net_down)}"
             f"  ↑ {Collector.fmt_speed_compact(s.net_up)}")
-        self._net_val.setStyleSheet(f"color:{st['green']};")
+        self._set_fg(self._net_val, st['green'])
         nics = s.net_nics or []
         if nics:
             self._nic_line.setText(" · ".join(
@@ -546,9 +556,11 @@ class DetailPanel(QWidget):
 
         self._foot.setText(_system_line(s))
 
-        # 分区/网卡行数变化会改变内容高度，面板是浮层不能留白，跟着收一次。
-        # 不能只在可见时收：面板首次是隐藏状态下刷新的，等用户打开时会带着旧高度。
-        self.adjustSize()
+        # 只有分区行数/网卡有无变化才会改高度，其余时候 adjustSize 是白跑一遍布局
+        key = (len(parts), bool(nics))
+        if key != self._size_key:
+            self._size_key = key
+            self.adjustSize()
 
     # ---- 拖动 ----
     def mousePressEvent(self, e):
@@ -784,17 +796,21 @@ class TaskbarStrip(QWidget):
         else:
             vram = f"{s.vram_gb:.0f}G"
         fmt = Collector.fmt_speed_compact
-        self._values = [
+        values = [
             f"{s.cpu:.0f}%", gpu, fmt(s.disk_read), fmt(s.net_up),
             f"{s.mem_pct:.0f}%", vram, fmt(s.disk_write), fmt(s.net_down),
         ]
         g, o = self._state["green"], self._state["orange"]
-        self._colors = [
+        colors = [
             self._pct_color(s.cpu), self._pct_color(s.gpu_pct),
             self._rate_color(s.disk_read, g), self._rate_color(s.net_up, g),
             self._pct_color(s.mem_pct), g,
             self._rate_color(s.disk_write, o), self._rate_color(s.net_down, g),
         ]
+        # 数字和颜色都没变就不用重绘——空闲机器上 CPU/网速经常一整分钟不动
+        if values == self._values and colors == self._colors:
+            return
+        self._values, self._colors = values, colors
         self.update()
 
 
@@ -840,6 +856,13 @@ class TrayApp:
         self._guard.timeout.connect(self._guard_zorder)
         self._guard.start(50)
 
+        # 全屏守护：独占全屏游戏/视频会把条压在上面，全屏期间藏起来，退出再放回。
+        # 500ms 够跟手，又不会为一次 GetForegroundWindow 花掉太多。
+        self._fs_hidden = False
+        self._fs_timer = QTimer(self._strip)
+        self._fs_timer.timeout.connect(self._check_fullscreen)
+        self._fs_timer.start(500)
+
         self._panel.show()
         self._panel.hide()  # 先 show 定位尺寸再 hide
         ppos = self._cfg.get("panel_pos")
@@ -851,6 +874,7 @@ class TrayApp:
             self._strip.show()
             bind_to_taskbar(self._strip)
             force_topmost(self._strip)
+        self._sync_rate()
         self._refresh_strip_menu()
 
         # 屏幕分辨率/缩放变化后重新贴位
@@ -1067,29 +1091,41 @@ class TrayApp:
             self._strip.hide()
         self._cfg["strip_visible"] = self._strip.isVisible()
         config.save(self._cfg)
+        self._sync_rate()
         self._refresh_strip_menu()
 
+    def _sync_rate(self):
+        """条和面板都藏着时没人看数字，采集降到 3 秒，省掉空转的 2/3。"""
+        busy = not self._strip.isHidden() or not self._panel.isHidden()
+        ms = self.REFRESH_MS if busy else 3000
+        if self._timer.interval() != ms:
+            self._timer.setInterval(ms)
+
     def toggle_panel(self):
-        if self._panel.isHidden():
-            # 面板隐藏时不刷新，先补一帧，否则打开瞬间是空白、要等下一个 tick。
-            # 必须在算位置之前，refresh 里的 adjustSize 会改高度。
-            self._panel.refresh()
+        p = self._panel
+        if p.isHidden():
+            # 面板隐藏期间跳过了分区/网卡明细，打开前必须补采一帧完整数据，
+            # 否则首屏分区卡是空的，要等下一次 tick 才填上。
+            self._col.tick(with_details=True)
+            p.refresh()
             pos = self._cfg.get("panel_pos")
             if pos:
-                self._panel.move(*pos)       # 沿用上次拖到的位置
+                p.move(*pos)       # 沿用上次拖到的位置
             else:
                 geo = self._app.primaryScreen().geometry()
-                w, h = self._panel.width(), self._panel.height()
-                self._panel.move(geo.width() - w - 12, geo.height() - h - 60)
-            self._panel.show()
-            self._panel.raise_()
-            self._panel.activateWindow()
+                w, h = p.width(), p.height()
+                p.move(geo.width() - w - 12, geo.height() - h - 60)
+            p.show()
+            p.raise_()
+            p.activateWindow()
         else:
-            self._panel.hide()
+            p.hide()
+        self._sync_rate()
         self._refresh_switch_menu()
 
     def _on_tick(self):
-        s = self._col.tick()
+        # 面板关着就不采分区/分网卡明细，省掉每秒一次的磁盘枚举
+        s = self._col.tick(with_details=not self._panel.isHidden())
         if not self._strip.isHidden():
             self._strip.refresh()
             bind_to_taskbar(self._strip)  # HWND 被 Qt 重建或 explorer 重启后补绑
@@ -1116,6 +1152,21 @@ class TrayApp:
         """高频层级守护：被任务栏压住就立刻顶回去（见 _guard 注释）。"""
         if not self._strip.isHidden():
             refresh_topmost(self._strip)
+
+    def _check_fullscreen(self):
+        """全屏就让位。_fs_hidden 单独记着，否则"自己藏起来"会被当成"用户关了条"。"""
+        if self._strip.isHidden() and not self._fs_hidden:
+            return                       # 用户手动关掉了，不插手
+        fs = fullscreen.is_fullscreen()
+        if fs and not self._fs_hidden:
+            self._strip.hide()
+            self._fs_hidden = True
+        elif not fs and self._fs_hidden:
+            self._fs_hidden = False
+            self._strip.show()
+            bind_to_taskbar(self._strip)
+            force_topmost(self._strip)
+        self._sync_rate()
 
     def _make_icon(self) -> QIcon:
         """自绘托盘图标：一个小仪表盘圆点。"""
