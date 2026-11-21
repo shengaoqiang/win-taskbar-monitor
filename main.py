@@ -33,7 +33,7 @@ from collector import Collector
 from widgets import Sparkline, MeterBar, CoreGrid
 from taskbar_pos import TaskbarInfo
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 # Win32 强制置顶：第三方窗口设了 StaysOnTop 也未必压得过 explorer 的任务栏，
 # 用 SetWindowPos(HWND_TOPMOST) 周期性把内嵌条重新顶到最前最稳。
